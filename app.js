@@ -424,6 +424,160 @@ function renderLibrary() {
     const g = document.createElement('div'); g.className = 'grid';
     me.library.forEach((m) => g.appendChild(posterCard(m)));
     el.appendChild(g);
+    try {
+      const u = await adGet('/user');
+      const usr = u.user || {};
+      const until = usr.premiumUntil ? new Date(usr.premiumUntil * 1000).toLocaleDateString() : '';
+      out.innerHTML = '<p class="ok" style="margin-top:10px">Connected as <b>' + esc(usr.username || '') + '</b>' + (usr.isPremium ? ' - Premium' + (until ? ' until ' + esc(until) : '') : ' - not premium right now') + '</p>';
+    } catch (e) { out.innerHTML = '<p class="err" style="margin-top:10px">' + esc(e.message) + '</p>'; }
+  };
+
+  if (isAdminProfile(me)) {
+  const profList = () => {
+    const z = $('#prof-list'); z.innerHTML = '';
+    const sel = $('#pin-reset-sel'); sel.innerHTML = '';
+    db.profiles.forEach((p) => {
+      const r = document.createElement('div'); r.className = 'file-row';
+      r.innerHTML = '<div class="f-name"><b>' + esc(p.name) + '</b>' + (p.isAdmin ? '<span class="kind-tag">ADMIN</span>' : '') + '</div>';
+      if (p.id !== me.id) {
+        const del = document.createElement('button'); del.className = 'dark-btn small-btn'; del.textContent = 'Delete';
+        del.onclick = () => { db.profiles = db.profiles.filter((x) => x.id !== p.id); saveDB(); profList(); toast('Profile deleted'); };
+        r.appendChild(del);
+      }
+      z.appendChild(r);
+      const o = document.createElement('option'); o.value = p.id; o.textContent = p.name; sel.appendChild(o);
+    });
+  };
+  profList();
+
+  $('#prof-add').onclick = async () => {
+    const name = $('#prof-name').value.trim();
+    const pin = $('#prof-pin').value.trim();
+    if (!name) { toast('Give the profile a name'); return; }
+    if (!/^\d{4,6}$/.test(pin)) { toast('PIN must be 4 to 6 numbers'); return; }
+    if (db.profiles.some((p) => p.name.toLowerCase() === name.toLowerCase())) { toast('That name is already used'); return; }
+    db.profiles.push({ id: uid(), name, pinHash: await hashPin(pin), isAdmin: false, adKey: '', library: [], history: [] });
+    saveDB(); profList();
+    $('#prof-name').value = ''; $('#prof-pin').value = '';
+    toast('Profile created for ' + name);
+  };
+  $('#pin-reset-go').onclick = async () => {
+    const pin = $('#pin-reset-val').value.trim();
+    if (!/^\d{4,6}$/.test(pin)) { toast('PIN must be 4 to 6 numbers'); return; }
+    const p = db.profiles.find((x) => x.id === $('#pin-reset-sel').value);
+    if (!p) return;
+    p.pinHash = await hashPin(pin); saveDB();
+    $('#pin-reset-val').value = '';
+    toast('PIN reset for ' + p.name);
+  };
+  }
+
+  const addonList = () => {
+    const z = $('#addon-list'); z.innerHTML = '';
+    db.addons.forEach((a, i) => {
+      const r = document.createElement('div'); r.className = 'file-row';
+      r.innerHTML = '<div class="f-name"><b>' + esc(a.name) + '</b><span class="kind-tag">' + esc(a.kind || 'stream') + '</span><br>' + esc(a.base) + '</div>';
+      const rm = document.createElement('button'); rm.className = 'dark-btn small-btn'; rm.textContent = 'Remove';
+      rm.onclick = () => { db.addons.splice(i, 1); saveDB(); addonList(); };
+      r.appendChild(rm); z.appendChild(r);
+    });
+  };
+  addonList();
+  $('#set-addon-add').onclick = async () => {
+    const url = $('#set-addon-url').value.trim();
+    if (!url) return;
+    try {
+      const man = await getJSON(url);
+      const base = url.replace(/\/manifest\.json(\?.*)?$/, '');
+      const res = man.resources || [];
+      const has = (n) => res.some((r) => (typeof r === 'string' ? r : r.name) === n);
+      let kind = 'stream';
+      if (has('subtitles') && !has('stream')) kind = 'subtitles';
+      db.addons.push({ name: man.name || base, base, kind });
+      saveDB();
+      $('#set-addon-url').value = '';
+      addonList(); toast('Addon added: ' + (man.name || base));
+    } catch (e) { toast('Could not load that manifest URL', 4500); }
+  };
+
+  if (isAdminProfile(me)) $('#export-btn').onclick = () => {
+    const clean = {
+      profiles: db.profiles.map((p) => ({ id: p.id, name: p.name, pinHash: p.pinHash, isAdmin: !!p.isAdmin })),
+      addons: db.addons
+    };
+    const blob = new Blob([JSON.stringify(clean, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'torrflix-setup.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    toast('Setup file downloaded - check your Downloads folder');
+  };
+  if (isAdminProfile(me)) $('#import-btn').onclick = () => {
+    if (!window.confirm('Importing replaces all profiles and addons on this PC. Continue?')) return;
+    importSetupFile(() => { toast('Setup imported - locking so you can log in fresh'); lockApp(); });
+  };
+}
+
+/* ---------- wiring ---------- */
+document.querySelectorAll('.nav-btn').forEach((b) => {
+  b.onclick = () => {
+    if (!me) return;
+    const n = b.dataset.nav;
+    if (n === 'home') { lastListView = 'home'; showView('home'); renderHome(); }
+    if (n === 'movies') { lastListView = 'browse'; showView('browse'); renderBrowse('movie'); }
+    if (n === 'series') { lastListView = 'browse'; showView('browse'); renderBrowse('series'); }
+    if (n === 'upcoming') { showView('upcoming'); renderUpcoming(); }
+    if (n === 'library') { showView('library'); renderLibrary(); }
+    if (n === 'debrid') { showView('debrid'); renderDebrid(); }
+    if (n === 'settings') { showView('settings'); renderSettings(); }
+  };
+});
+$('#back-btn').onclick = () => { if (lastListView === 'browse') { showView('browse'); } else { showView('home'); renderHome(); } };
+$('#player-back').onclick = () => { if (currentMeta) { openDetail(currentMeta.type, currentMeta.id); } else { showView('home'); renderHome(); } };
+$('#player-copy').onclick = () => { if (currentPlay) { window.crimson.copyText(currentPlay.url); toast('Stream link copied'); } };
+let audioGraph = null;
+function teardownBoost() {
+  const old = $('#player');
+  const t = old ? (old.currentTime || 0) : 0;
+  const fresh = document.createElement('video');
+  fresh.id = 'player'; fresh.controls = true; fresh.autoplay = true;
+  if (old) old.replaceWith(fresh);
+  if (audioGraph) { try { audioGraph.ac.close(); } catch (e) {} audioGraph = null; }
+  if (currentPlay) playUrl(currentPlay.url, currentPlay.title, currentPlay.ctx, t > 5 ? t : 0);
+}
+$('#boost-sel').onchange = () => {
+  const v = parseFloat($('#boost-sel').value);
+  if (v === 1 && audioGraph) { teardownBoost(); toast('Volume boost off'); return; }
+  const vid = $('#player');
+  try {
+    if (!audioGraph) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) { toast('Volume boost is not supported on this device'); return; }
+      const ac = new AC();
+      const srcNode = ac.createMediaElementSource(vid);
+      const gain = ac.createGain();
+      const comp = ac.createDynamicsCompressor();
+      comp.threshold.value = -18; comp.ratio.value = 12; comp.attack.value = 0.003; comp.release.value = 0.25;
+      srcNode.connect(gain); gain.connect(comp); comp.connect(ac.destination);
+      audioGraph = { ac, gain };
+    }
+    if (audioGraph.ac.state === 'suspended') audioGraph.ac.resume();
+    audioGraph.gain.gain.value = v;
+    toast(v > 1 ? 'Volume boost ' + v + 'x' : 'Volume boost off');
+  } catch (e) { toast('Boost would not start on this stream. If the sound ever cuts out with boost on, restart the app.', 5000); }
+};
+$('#lock-btn').onclick = lockApp;
+
+const doSearch = () => {
+  const q = $('#search-input').value.trim();
+  if (!q || !me) return;
+  lastListView = 'browse'; showView('browse'); renderSearch(q);
+};
+$('#search-btn').onclick = doSearch;
+$('#search-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
+
+renderLock();
   }
   el.appendChild(rowTitle('Watch History'));
   const hist = (me.history || []).slice();
