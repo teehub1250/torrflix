@@ -254,6 +254,346 @@ async function localStreamData(type, videoId) {
   }
   await Promise.all(jobs);
   const rows = Array.from(found.values()).map((r) => ({ ...r, q: qualityOf(r.name) }));
+        const data = await getJSON(a.base + '/subtitles/' + type + '/' + encodeURIComponent(videoId) + '.json');
+        (data.subtitles || []).forEach((s) => all.push(s));
+      } catch (e) {}
+    }));
+    const eng = all.filter((s) => /^(eng?|english)$/i.test(String(s.lang || ''))).slice(0, 3);
+    for (let i = 0; i < eng.length; i++) {
+      try {
+        const r = await fetch(eng[i].url);
+        if (!r.ok) continue;
+        let text = await r.text();
+        if (!/^\s*WEBVTT/.test(text)) text = srtToVtt(text);
+        const blobUrl = URL.createObjectURL(new Blob([text], { type: 'text/vtt' }));
+        const track = document.createElement('track');
+        track.kind = 'subtitles'; track.label = 'English ' + (i + 1); track.srclang = 'en';
+        track.src = blobUrl;
+        if (i === 0) track.default = true;
+        vid.appendChild(track);
+      } catch (e) { /* subtitle fetch failed, carry on without it */ }
+    }
+  } catch (e) {}
+}
+
+function historyKeyFor(title, ctx, url) { return ctx ? (ctx.type + ':' + ctx.videoId) : ('file:' + (title || url)); }
+
+function logHistory(url, title, ctx, progress, duration) {
+  if (!me) return;
+  const key = historyKeyFor(title, ctx, url);
+  const i = me.history.findIndex((h) => h.key === key);
+  const prev = i >= 0 ? me.history[i] : null;
+  const entry = {
+    key,
+    id: ctx ? ctx.id : '', type: ctx ? ctx.type : 'file', videoId: ctx ? ctx.videoId : '',
+    name: ctx ? ctx.name : (title || 'AllDebrid file'), poster: ctx ? (ctx.poster || '') : '',
+    streamUrl: url, progress: progress != null ? progress : (prev ? prev.progress : 0),
+    duration: duration != null ? duration : (prev ? prev.duration : 0), updated: Date.now()
+  };
+  if (i >= 0) me.history[i] = entry; else me.history.unshift(entry);
+  me.history = me.history.slice(0, 40);
+  saveDB();
+}
+
+async function fetchEnglishSubUrls(type, videoId) {
+  const all = [];
+  await Promise.all(subAddons().map(async (a) => {
+    try {
+      const data = await getJSON(a.base + '/subtitles/' + type + '/' + encodeURIComponent(videoId) + '.json');
+      (data.subtitles || []).forEach((s) => all.push(s));
+    } catch (e) {}
+  }));
+  return all.filter((s) => /^(eng?|english)$/i.test(String(s.lang || ''))).slice(0, 3).map((s) => s.url);
+}
+
+function playUrl(url, title, ctx, resumeAt) {
+  if (!url) { toast('No playable link'); return; }
+  currentPlay = { url, title, ctx };
+  if (window.crimson && window.crimson.playPlayer) playViaBuiltinPlayer(url, title, ctx, resumeAt);
+  else playInWebPlayer(url, title, ctx, resumeAt);
+}
+
+async function playViaBuiltinPlayer(url, title, ctx, resumeAt) {
+  $('#player-title').textContent = title || '';
+  const vid = $('#player'); try { vid.pause(); vid.removeAttribute('src'); vid.load(); } catch (e) {}
+  showView('player');
+  const msg = $('#player-msg');
+  msg.classList.remove('hidden');
+  msg.innerHTML = 'Starting the TorrFlix player...';
+  logHistory(url, title, ctx, resumeAt || 0, 0);
+  let unsub = null;
+  if (window.crimson.onPlayerProgress) unsub = window.crimson.onPlayerProgress((d) => { msg.innerHTML = 'Downloading the TorrFlix player - one time only... ' + (d.pct || 0) + '%'; });
+  let res = null;
+  try { res = await window.crimson.ensurePlayer(); } catch (e) {}
+  if (typeof unsub === 'function') unsub();
+  if (res && res.status === 'ready') {
+    let subs = [];
+    if (ctx) { try { subs = await fetchEnglishSubUrls(ctx.type, ctx.videoId); } catch (e) {} }
+    let r = null;
+    try { r = await window.crimson.playPlayer({ url, start: resumeAt || 0, subs }); } catch (e) {}
+    if (r && r.ok) {
+      msg.innerHTML = '<b>Playing in the TorrFlix player</b> - it opened in its own fullscreen window and plays everything, sound included. When you are done, just close that window.';
+      return;
+    }
+  }
+  msg.innerHTML = 'The TorrFlix player could not start, so the built-in web player is taking over. Some files (4K, MKV, AC3/DTS sound) may not play properly in it.';
+  playInWebPlayer(url, title, ctx, resumeAt);
+}
+    if (btn) btn.textContent = 'AllDebrid is fetching it... (' + ((st && st.status) || 'working') + ')';
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  throw new Error('Timed out waiting for AllDebrid');
+}
+
+async function adPlayMagnet(magnet, label, ctx, btn) {
+  if (needKey()) return;
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending to AllDebrid...'; }
+  try {
+    const links = await adFetchMagnetLinks(magnet, btn);
+    if (!links.length) throw new Error('No files came back from AllDebrid');
+    const videoExt = /\.(mkv|mp4|avi|mov|m4v|webm|ts)$/i;
+    links.sort((a, b) => (b.size || 0) - (a.size || 0));
+    const pick = links.find((l) => videoExt.test(l.filename || '')) || links[0];
+    if (links.length > 1) toast('Picked the biggest video file: ' + (pick.filename || ''));
+    const un = await adGet('/link/unlock', { link: pick.link });
+    playUrl(un.link, label, ctx);
+  } catch (e) {
+    toast('AllDebrid: ' + e.message, 5000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = old; }
+  }
+}
+
+function adFileRow(l, directUrl) {
+  const row = document.createElement('div'); row.className = 'file-row clickable';
+  row.title = 'Click to play';
+  row.innerHTML = '<div class="f-name">' + esc(l.filename || l.link) + '</div><div class="f-size">' + fmtBytes(l.size) + '</div>';
+  const copy = document.createElement('button'); copy.className = 'dark-btn small-btn'; copy.textContent = 'Copy link';
+  const go = async () => {
+    if (directUrl) return directUrl;
+    const un = await adGet('/link/unlock', { link: l.link });
+    return un.link;
+  };
+  row.onclick = async () => {
+    toast('Getting your link...');
+    try { const u = await go(); playUrl(u, l.filename || 'AllDebrid file', null); } catch (e) { toast(e.message, 4500); }
+  };
+  copy.onclick = async (ev) => { ev.stopPropagation(); try { const u = await go(); window.crimson.copyText(u); toast('Direct link copied'); } catch (e) { toast(e.message, 4500); } };
+  row.appendChild(copy);
+  return row;
+}
+
+function renderDebrid() {
+  const el = $('#view-debrid');
+  el.innerHTML =
+    '<div class="row-title">AllDebrid</div>' +
+    '<div class="panel"><h3>Paste a magnet or a link</h3>' +
+    '<p>AllDebrid will fetch it and hand back a direct link you can play right here. Torrents come back as the files inside them - pick the video file.</p>' +
+    '<label>Magnet link or file-host link</label>' +
+    '<textarea id="ad-input" rows="3" placeholder="magnet:?xt=urn:btih:... or https://..."></textarea>' +
+    '<div class="btn-row"><button class="red-btn" id="ad-go">Unlock / Fetch</button></div>' +
+    '<div id="ad-result"></div></div>';
+  $('#ad-go').onclick = async () => {
+    if (needKey()) return;
+    const val = $('#ad-input').value.trim();
+    const out = $('#ad-result');
+    if (!val) { toast('Paste something first'); return; }
+    out.innerHTML = '<div class="loading">Talking to AllDebrid...</div>';
+    try {
+      if (val.indexOf('magnet:') === 0) {
+        const links = await adFetchMagnetLinks(val, null);
+        out.innerHTML = '<p style="margin-top:12px">Files ready - click one to play it:</p>';
+        links.forEach((l) => out.appendChild(adFileRow(l)));
+      } else {
+        const un = await adGet('/link/unlock', { link: val });
+        out.innerHTML = '';
+        out.appendChild(adFileRow({ link: val, filename: un.filename, size: un.filesize }, un.link));
+      }
+    } catch (e) { out.innerHTML = '<p class="err" style="margin-top:12px">' + esc(e.message) + '</p>'; }
+  };
+}
+
+/* ---------- library ---------- */
+function renderLibrary() {
+  const el = $('#view-library');
+  el.innerHTML = '';
+  el.appendChild(rowTitle('My Library'));
+  if (!me.library.length) { el.innerHTML += '<div class="empty">Nothing saved yet. Open any movie or show and hit "+ My Library".</div>'; }
+  else {
+    const g = document.createElement('div'); g.className = 'grid';
+    me.library.forEach((m) => g.appendChild(posterCard(m)));
+    el.appendChild(g);
+  }
+  el.appendChild(rowTitle('Watch History'));
+  const hist = (me.history || []).slice();
+  if (!hist.length) { el.innerHTML += '<div class="empty">Nothing watched yet. Everything you play lands here.</div>'; return; }
+  const clear = document.createElement('button'); clear.className = 'dark-btn small-btn'; clear.textContent = 'Clear history';
+  clear.onclick = () => { me.history = []; saveDB(); renderLibrary(); };
+  el.appendChild(clear);
+  hist.forEach((h) => {
+    const row = document.createElement('div'); row.className = 'file-row clickable';
+    const when = h.updated ? new Date(h.updated).toLocaleString() : '';
+    const pct = h.duration > 0 ? Math.round((h.progress / h.duration) * 100) : 0;
+    row.innerHTML = '<div class="f-name"><b>' + esc(h.name || 'Untitled') + '</b><br><span style="color:var(--muted);font-size:12px">' + esc(when) + (pct ? ' - watched ' + pct + '%' : '') + '</span></div>';
+    const rm = document.createElement('button'); rm.className = 'dark-btn small-btn'; rm.textContent = 'Remove';
+    rm.onclick = (ev) => { ev.stopPropagation(); me.history = me.history.filter((x) => x.key !== h.key); saveDB(); renderLibrary(); };
+    row.onclick = () => {
+      if (h.type === 'file') playUrl(h.streamUrl, h.name, null, h.progress);
+      else playUrl(h.streamUrl, h.name, { id: h.id, type: h.type, videoId: h.videoId, name: h.name, poster: h.poster }, h.progress);
+    };
+    row.appendChild(rm);
+    el.appendChild(row);
+  });
+}
+
+/* ---------- settings ---------- */
+function renderSettings() {
+  const el = $('#view-settings');
+  let html = '<div class="row-title">Settings</div>';
+  html += '<div class="panel"><h3>My AllDebrid</h3>' +
+    '<p>Your own AllDebrid API key - get it from your AllDebrid account under API keys, then paste it here. It is stored only on this PC, under your profile.</p>' +
+    '<label>AllDebrid API key</label>' +
+    '<input type="password" id="set-adkey" value="' + esc(me.adKey || '') + '" placeholder="Paste your API key">' +
+    '<div class="btn-row"><button class="red-btn" id="set-ad-save">Save key</button>' +
+    '<button class="dark-btn" id="set-ad-check">Check account</button>' +
+    '<button class="dark-btn" id="set-ad-open">Open AllDebrid API page</button></div>' +
+    '<div id="ad-check-out"></div></div>';
+
+  html += '<div class="panel"><h3>Streaming sources (AllDebrid)</h3>' +
+    '<p>Here is the part nobody tells you: AllDebrid only works properly when the unlocking happens from <b>your own connection</b> - and TorrFlix already does that itself. So the addons here are just <b>finders</b>. They find the releases, and when you tap a stream, TorrFlix unlocks it through your AllDebrid account, from your PC. That path cannot be blocked or switched off by anyone.</p>' +
+    '<p><b>TorrFlix Streams is already built in</b> - it is our own finder, it searches the public indexes and ranks results by quality and seeds, and it works with AllDebrid in one click. The options below are only if you ever want extra finders on top.</p>' +
+    '<p>Why not pick AllDebrid inside MediaFusion? MediaFusion\'s own docs say AllDebrid only works when MediaFusion runs on your own machine - on every public instance it is a dead end, and ElfHosted (the big public host) no longer supports AllDebrid at all. That is why it failed you.</p>' +
+    '<p><b>Option 1 - one tap:</b> add Torrentio as a finder only. No key inside it, nothing to configure - TorrFlix does the AllDebrid part.</p>' +
+    '<p><b>Option 2:</b> MediaFusion as a finder. On its configure page choose <b>Direct Torrent</b> as the provider (NOT AllDebrid), copy the manifest link it gives you, and paste it in the Add an addon box below.</p>' +
+    '<div class="btn-row"><button class="red-btn" id="src-tio">Add Torrentio as a finder</button>' +
+    '<button class="dark-btn" id="src-mf">Configure MediaFusion as a finder</button></div></div>';
+
+  html += '<div class="panel"><h3>Stream addons</h3>' +
+    '<p>Addons are how TorrFlix finds streams and subtitles - the same system Stremio uses. For movie and TV streams through AllDebrid, use the Streaming sources panel above. Subtitles (OpenSubtitles) are already loaded.</p>' +
+    '<div id="addon-list"></div>' +
+    '<label>Add an addon (manifest URL)</label>' +
+    '<input type="text" id="set-addon-url" placeholder="https://.../manifest.json">' +
+    '<div class="btn-row"><button class="red-btn" id="set-addon-add">Add addon</button></div></div>';
+
+  if (isAdminProfile(me)) {
+    html += '<div class="panel"><h3>Profiles (admin)</h3>' +
+      '<p>Make a profile and a PIN for each person. They pick their name on the first screen and type their PIN.</p>' +
+      '<div id="prof-list"></div>' +
+      '<label>New profile name</label><input type="text" id="prof-name" placeholder="Name">' +
+      '<label>PIN (4-6 numbers)</label><input type="text" id="prof-pin" inputmode="numeric" maxlength="6" placeholder="PIN">' +
+      '<div class="btn-row"><button class="red-btn" id="prof-add">Create profile</button></div>' +
+      '<label style="margin-top:22px">Reset a PIN</label>' +
+      '<div class="btn-row" style="margin-top:0"><select id="pin-reset-sel" style="flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:10px;"></select>' +
+      '<input type="text" id="pin-reset-val" inputmode="numeric" maxlength="6" placeholder="New PIN" style="width:130px">' +
+      '<button class="dark-btn" id="pin-reset-go">Reset PIN</button></div></div>';
+
+    html += '<div class="panel"><h3>Hand TorrFlix to someone (admin)</h3>' +
+      '<p>Export a setup file, then give the person the app plus this file. On their first screen they tap "Import it", pick the file, and log in with the PIN you gave them. The file carries the profiles, PINs and addons - never any AllDebrid keys. Each person adds their own AllDebrid key in Settings.</p>' +
+      '<div class="btn-row"><button class="red-btn" id="export-btn">Export setup file</button>' +
+      '<button class="dark-btn" id="import-btn">Import setup file</button></div></div>';
+  }
+  el.innerHTML = html;
+
+  $('#src-tio').onclick = () => {
+    if (db.addons.some((a) => /torrentio\.strem\.fun/i.test(a.base || ''))) { toast('Torrentio finder is already added'); return; }
+    db.addons.push({ name: 'Torrentio', base: 'https://torrentio.strem.fun', kind: 'stream' });
+    saveDB(); if (typeof addonList === 'function') addonList();
+    toast('Torrentio added as a finder');
+  };
+  $('#src-mf').onclick = () => window.crimson.openExternal('https://mediafusion.elfhosted.com/configure');
+  $('#set-ad-save').onclick = () => { me.adKey = $('#set-adkey').value.trim(); saveDB(); adStatusLine(); toast('API key saved'); };
+  $('#set-ad-open').onclick = () => window.crimson.openExternal('https://alldebrid.com/apikeys');
+  $('#set-ad-check').onclick = async () => {
+    const out = $('#ad-check-out');
+    me.adKey = $('#set-adkey').value.trim(); saveDB(); adStatusLine();
+    if (!me.adKey) { out.innerHTML = '<p class="err" style="margin-top:10px">No key entered.</p>'; return; }
+    out.innerHTML = '<div class="loading">Checking...</div>';
+
+function playInWebPlayer(url, title, ctx, resumeAt) {
+  $('#player-title').textContent = title || '';
+  const vid = $('#player');
+  const msg = $('#player-msg');
+  msg.classList.add('hidden'); msg.textContent = '';
+  Array.from(vid.querySelectorAll('track')).forEach((t) => t.remove());
+  showView('player');
+  try { const fp = vid.requestFullscreen && vid.requestFullscreen(); if (fp && fp.catch) fp.catch(() => {}); } catch (e) {}
+  logHistory(url, title, ctx, resumeAt || 0, 0);
+  vid.src = url;
+  vid.onloadedmetadata = () => { if (resumeAt && resumeAt > 5 && vid.duration && resumeAt < vid.duration - 10) vid.currentTime = resumeAt; };
+  vid.onerror = () => {
+    msg.innerHTML = 'This file would not play in the built-in player. This is common with 4K, MKV and HEVC files.';
+    msg.classList.remove('hidden');
+  };
+  let lastSave = 0;
+  vid.ontimeupdate = () => {
+    const now = Date.now();
+    if (now - lastSave < 5000 || !me) return;
+    lastSave = now;
+    logHistory(url, title, ctx, vid.currentTime, vid.duration || 0);
+  };
+  if (ctx) attachSubtitles(vid, ctx.type, ctx.videoId);
+  vid.play().catch(() => {});
+  const myPlay = currentPlay;
+  setTimeout(() => {
+    if (currentPlay !== myPlay) return;
+    const v2 = $('#player');
+    if (!v2 || v2.paused || v2.currentTime < 2) return;
+    if (typeof v2.webkitAudioDecodedByteCount === 'number' && v2.webkitAudioDecodedByteCount === 0 && !audioGraph) {
+      msg.innerHTML = 'This one is playing with <b>no sound</b> in the built-in player - its audio track (usually AC3 or DTS) cannot be decoded here. The TorrFlix player handles it; if it did not open, check your connection and press Play again.';
+      msg.classList.remove('hidden');
+    }
+  }, 5000);
+}
+
+function adUrl(path, params, base) {
+  const q = new URLSearchParams(Object.assign({ agent: AD_AGENT, apikey: me ? me.adKey : '' }, params || {}));
+  return (base || AD_API) + path + '?' + q.toString();
+}
+async function adGet(path, params, base) {
+  const data = await getJSON(adUrl(path, params, base));
+  if (data.status === 'error') throw new Error((data.error && data.error.message) || 'AllDebrid error');
+  return data.data;
+}
+const AD_API41 = 'https://api.alldebrid.com/v4.1';
+async function adPost(path, params) {
+  const body = new URLSearchParams(Object.assign({ agent: AD_AGENT, apikey: me ? me.adKey : '' }, params || {}));
+  const r = await fetch(AD_API + path, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  const data = await r.json();
+  if (data.status === 'error') throw new Error((data.error && data.error.message) || 'AllDebrid error');
+  return data.data;
+}
+async function adMagnetFiles(id) {
+  let data;
+  try { data = await adGet('/magnet/files', { id }, AD_API41); }
+  catch (e) { data = await adPost('/magnet/files', { 'id[]': id }); }
+  const mag = (data.magnets || [])[0];
+  if (!mag) throw new Error('No files came back from AllDebrid');
+  if (mag.error) throw new Error(mag.error.message || 'Could not get the files');
+  const out = [];
+  const walk = (entries) => { (entries || []).forEach((f) => { if (f.e) walk(f.e); else if (f.l) out.push({ filename: f.n, size: f.s, link: f.l }); }); };
+  walk(mag.files);
+  return out;
+}
+function needKey() {
+  if (!me || !me.adKey) { toast('Add your AllDebrid API key in Settings first'); showView('settings'); renderSettings(); return true; }
+  return false;
+}
+function adStatusLine() {
+  $('#ad-status').textContent = me && me.adKey ? 'AllDebrid: key saved' : 'AllDebrid: not set up';
+}
+
+async function adFetchMagnetLinks(magnet, btn) {
+  const up = await adGet('/magnet/upload', { 'magnets[]': magnet });
+  const m = (up.magnets || [])[0];
+  if (!m) throw new Error('AllDebrid did not accept the magnet');
+  if (m.error) throw new Error(m.error.message || 'Magnet rejected');
+  for (let i = 0; i < 40; i++) {
+    const raw = await adGet('/magnet/status', { id: m.id }, AD_API41);
+    const st = raw && raw.magnets ? (Array.isArray(raw.magnets) ? raw.magnets[0] : raw.magnets) : raw;
+    const code = st ? st.statusCode : null;
+    if (code === 4 || (st && st.status === 'Ready')) return adMagnetFiles(m.id);
+    if (code != null && code > 4) throw new Error('AllDebrid: ' + (st.status || 'failed'));
   rows.sort((a, b) => (b.q.rank - a.q.rank) || (b.seeds - a.seeds));
   return {
     streams: rows.slice(0, 15).map((r) => ({
