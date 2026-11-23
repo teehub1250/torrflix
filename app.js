@@ -166,6 +166,176 @@ async function renderSearch(q) {
     all.forEach((m) => g.appendChild(posterCard(m)));
     el.appendChild(g);
   } catch (e) { el.innerHTML = '<div class="empty">Search failed. Check the connection.</div>'; }
+      }
+      upcomingCache = await Promise.all(days.map(async (d) => {
+        try { const items = await tfFetchJSON('https://api.tvmaze.com/schedule?country=US&date=' + d.iso); return { ...d, items: Array.isArray(items) ? items : [] }; }
+        catch (e) { return { ...d, items: [] }; }
+      }));
+    }
+    let html = '<div class="row-title">Coming Soon</div><p class="hint">New episodes airing in the next 7 days (US schedule). Tap a show to open it - once an episode has aired, its streams show up like normal.</p>';
+    upcomingCache.forEach((d) => {
+      const items = d.items.filter((it) => it && it.show && it.show.name).sort((a, b) => String(a.airtime || '').localeCompare(String(b.airtime || '')));
+      if (!items.length) return;
+      html += '<div class="row-title">' + esc(d.label) + '</div>';
+      items.slice(0, 40).forEach((it) => {
+        const sh = it.show;
+        const img = sh.image && sh.image.medium ? sh.image.medium : '';
+        const net = (sh.network && sh.network.name) || (sh.webChannel && sh.webChannel.name) || '';
+        const premiere = it.season === 1 && it.number === 1;
+        html += '<div class="up-row" data-imdb="' + esc((sh.externals && sh.externals.imdb) || '') + '" data-name="' + esc(sh.name) + '">' +
+          (img ? '<img class="up-img" src="' + esc(img) + '" alt="">' : '<div class="up-img"></div>') +
+          '<div class="ep-t"><div>' + esc(sh.name) + (premiere ? ' <span class="up-badge">PREMIERE</span>' : '') + '</div>' +
+          '<div class="ep-n">S' + it.season + ' E' + it.number + ' - ' + esc(it.name || '') + (it.airtime ? ' - ' + esc(it.airtime) : '') + (net ? ' - ' + esc(net) : '') + '</div></div></div>';
+      });
+    });
+    el.innerHTML = html;
+    el.querySelectorAll('.up-row').forEach((r) => {
+      r.style.cursor = 'pointer';
+      r.onclick = () => {
+        if (r.dataset.imdb) openDetail('series', r.dataset.imdb);
+        else { lastListView = 'browse'; showView('browse'); renderSearch(r.dataset.name); }
+      };
+    });
+  } catch (e) { el.innerHTML = '<div class="empty">Could not load the schedule right now.</div>'; }
+}
+
+/* ---------- TorrFlix Streams: our own built-in finder ----------
+   Original code on the open Stremio addon protocol. It asks public
+   torrent indexes for the IMDb id (or the episode), ranks the results
+   by quality and seeds, and hands back plain torrent hashes.
+   TorrFlix then unlocks the pick through the user's own AllDebrid. */
+async function tfFetchJSON(url) {
+  if (window.crimson && window.crimson.fetchJson) return window.crimson.fetchJson(url);
+  return getJSON(url);
+}
+function qualityOf(name) {
+  const n = String(name || '').toLowerCase();
+  if (/2160p|4k|uhd/.test(n)) return { rank: 4, label: '2160p 4K' };
+  if (/1080p/.test(n)) return { rank: 3, label: '1080p' };
+  if (/720p/.test(n)) return { rank: 2, label: '720p' };
+  if (/480p|360p/.test(n)) return { rank: 1, label: 'SD' };
+  return { rank: 2, label: 'HD' };
+}
+async function localStreamData(type, videoId) {
+  const parts = String(videoId).split(':');
+  const imdb = parts[0];
+  const season = parts.length > 1 ? parseInt(parts[1], 10) : null;
+  const episode = parts.length > 2 ? parseInt(parts[2], 10) : null;
+  const found = new Map();
+  const add = (hash, name, seeds, size) => {
+    if (!hash || !/^[a-f0-9]{40}$/i.test(hash) || /^0+$/.test(hash)) return;
+    const key = hash.toLowerCase();
+    const prev = found.get(key);
+    if (!prev || (seeds || 0) > prev.seeds) found.set(key, { hash: key, name: String(name || ''), seeds: seeds || 0, size: size || 0 });
+  };
+  const jobs = [];
+  if (type === 'movie') {
+    jobs.push((async () => {
+      const d = await tfFetchJSON('https://apibay.org/q.php?q=' + encodeURIComponent(imdb) + '&cat=200');
+      (Array.isArray(d) ? d : []).forEach((t) => { if (Number(t.size) > 150 * 1048576) add(t.info_hash, t.name, Number(t.seeders), Number(t.size)); });
+    })().catch(() => {}));
+  } else {
+    jobs.push((async () => {
+      const d = await tfFetchJSON('https://eztvx.to/api/get-torrents?imdb_id=' + encodeURIComponent(imdb.replace(/^tt/, '')) + '&limit=100&page=1');
+      (d.torrents || []).forEach((t) => {
+        if (season != null && Number(t.season) !== season) return;
+        if (episode != null && Number(t.episode) !== episode) return;
+        add(t.hash, t.filename, Number(t.seeds), Number(t.size_bytes));
+      });
+    })().catch(() => {}));
+    jobs.push((async () => {
+      const meta = await tfFetchJSON('https://v3-cinemeta.strem.io/meta/series/' + encodeURIComponent(imdb) + '.json');
+      const seriesName = meta && meta.meta && meta.meta.name;
+      if (!seriesName) return;
+      const ep = 'S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0');
+      const d = await tfFetchJSON('https://apibay.org/q.php?q=' + encodeURIComponent(seriesName + ' ' + ep) + '&cat=200');
+      (Array.isArray(d) ? d : []).forEach((t) => { if (Number(t.size) > 80 * 1048576) add(t.info_hash, t.name, Number(t.seeders), Number(t.size)); });
+    })().catch(() => {}));
+  }
+  await Promise.all(jobs);
+  const rows = Array.from(found.values()).map((r) => ({ ...r, q: qualityOf(r.name) }));
+  rows.sort((a, b) => (b.q.rank - a.q.rank) || (b.seeds - a.seeds));
+  return {
+    streams: rows.slice(0, 15).map((r) => ({
+      name: 'TorrFlix Streams\n' + r.q.label,
+      title: r.name + '\nSeeds: ' + r.seeds + (r.size ? '   Size: ' + fmtBytes(r.size) : ''),
+      infoHash: r.hash,
+      behaviorHints: { filename: r.name, notWebReady: true }
+    }))
+  };
+}
+
+async function loadStreams(type, videoId, label) {
+  const zone = $('#stream-zone');
+  if (!zone) return;
+  zone.innerHTML = '<div class="loading">Asking your addons for streams...</div>';
+  zone.scrollIntoView({ behavior: 'smooth' });
+  const results = [];
+  await Promise.all(streamAddons().map(async (a) => {
+    try {
+      const data = a.base === 'torrflix://streams' ? await localStreamData(type, videoId) : await getJSON(a.base + '/stream/' + type + '/' + encodeURIComponent(videoId) + '.json');
+      (data.streams || []).forEach((s) => results.push({ addon: a.name, s }));
+    } catch (e) { /* addon offline or no streams */ }
+  }));
+  if (!results.length) {
+    zone.innerHTML = '<div class="row-title">Streams</div><div class="empty">No streams found this time. TorrFlix Streams searches the public indexes by title, so a very new or very obscure release may not be listed yet - try again later, or add another finder in Settings.</div>';
+    return;
+  }
+  zone.innerHTML = '';
+  zone.appendChild(rowTitle('Streams - ' + label));
+  results.forEach(({ addon, s }) => {
+    const row = document.createElement('div'); row.className = 'stream';
+    const name = (s.name || addon).trim();
+    const title = (s.title || s.description || '').trim();
+    let btns = '';
+    if (s.url) btns += '<button class="red-btn small-btn act-play">Play</button>';
+    if (s.infoHash) {
+      btns += '<button class="red-btn small-btn act-ad">Play via AllDebrid</button>';
+      btns += '<button class="dark-btn small-btn act-magnet">Copy magnet</button>';
+    }
+    if (s.externalUrl) btns += '<button class="dark-btn small-btn act-ext">Open external</button>';
+    row.innerHTML = '<div class="s-body"><div class="s-name">' + esc(name) + '</div><div class="s-title">' + esc(title) + '</div></div><div class="s-btns">' + btns + '</div>';
+    row.style.cursor = 'pointer';
+    row.title = 'Click to play';
+    row.onclick = (e) => {
+      if (e.target.closest('button')) return;
+      const ctx = { id: currentMeta.id, type: currentMeta.type, videoId, name: currentMeta.name, poster: currentMeta.poster };
+      if (s.infoHash && me && me.alldebridKey) adPlayMagnet(magnetFromStream(s), label, ctx, null);
+      else if (s.url) playUrl(s.url, label, ctx);
+      else if (s.infoHash) adPlayMagnet(magnetFromStream(s), label, ctx, null);
+      else if (s.externalUrl) window.crimson.openExternal(s.externalUrl);
+    };
+    const play = row.querySelector('.act-play');
+    if (play) play.onclick = () => playUrl(s.url, label, { id: currentMeta.id, type: currentMeta.type, videoId, name: currentMeta.name, poster: currentMeta.poster });
+    const ad = row.querySelector('.act-ad');
+    if (ad) ad.onclick = () => adPlayMagnet(magnetFromStream(s), label, { id: currentMeta.id, type: currentMeta.type, videoId, name: currentMeta.name, poster: currentMeta.poster }, ad);
+    const mg = row.querySelector('.act-magnet');
+    if (mg) mg.onclick = () => { window.crimson.copyText(magnetFromStream(s)); toast('Magnet link copied'); };
+    const ex = row.querySelector('.act-ext');
+    if (ex) ex.onclick = () => window.crimson.openExternal(s.externalUrl);
+    zone.appendChild(row);
+  });
+}
+
+/* Mouse wheel scrolls poster rows sideways */
+document.addEventListener('wheel', (e) => {
+  const row = e.target && e.target.closest ? e.target.closest('.row') : null;
+  if (row && row.scrollWidth > row.clientWidth && Math.abs(e.deltaY) >= Math.abs(e.deltaX)) {
+    row.scrollLeft += e.deltaY;
+    e.preventDefault();
+  }
+}, { passive: false });
+
+/* ---------- player + subtitles ---------- */
+function srtToVtt(srt) {
+  return 'WEBVTT\n\n' + srt.replace(/\r+/g, '').replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+}
+
+async function attachSubtitles(vid, type, videoId) {
+  try {
+    const all = [];
+    await Promise.all(subAddons().map(async (a) => {
+      try {
 }
 
 /* ---------- detail ---------- */
