@@ -388,6 +388,23 @@ async function tfFetchJSON(url) {
   if (window.crimson && window.crimson.fetchJson) return window.crimson.fetchJson(url);
   return getJSON(url);
 }
+/* APIbay sends no CORS headers, so browsers (this web build) can't read it
+   direct — same latent bug the Xbox builds had. Same fix as Xbox: try
+   direct first, then Torrin's own Vercel search helper, then public CORS
+   relays. No AllDebrid keys or account data pass through the helper. */
+const TF_HELPER = 'https://torrflix.vercel.app/api/search';
+function tfWithTimeout(promise, ms) {
+  return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
+}
+async function tfSearchJSON(url) {
+  try { return await tfFetchJSON(url); } catch (e) {}
+  try { return await tfWithTimeout(getJSON(TF_HELPER + '?url=' + encodeURIComponent(url)), 15000); } catch (e) {}
+  const relays = ['https://corsproxy.io/?url=', 'https://api.allorigins.win/raw?url=', 'https://api.codetabs.com/v1/proxy?quest=', 'https://api.cors.lol/?url='];
+  for (const r of relays) {
+    try { return await tfWithTimeout(getJSON(r + encodeURIComponent(url)), 15000); } catch (e) {}
+  }
+  throw new Error('Search source unreachable');
+}
 function qualityOf(name) {
   const n = String(name || '').toLowerCase();
   if (/2160p|4k|uhd/.test(n)) return { rank: 4, label: '2160p 4K' };
@@ -411,8 +428,13 @@ async function localStreamData(type, videoId) {
   const jobs = [];
   if (type === 'movie') {
     jobs.push((async () => {
-      const d = await tfFetchJSON('https://apibay.org/q.php?q=' + encodeURIComponent(imdb) + '&cat=200');
+      const d = await tfSearchJSON('https://apibay.org/q.php?q=' + encodeURIComponent(imdb) + '&cat=200');
       (Array.isArray(d) ? d : []).forEach((t) => { if (Number(t.size) > 150 * 1048576) add(t.info_hash, t.name, Number(t.seeders), Number(t.size)); });
+    })().catch(() => {}));
+    jobs.push((async () => {
+      const d = await tfFetchJSON('https://yts.mx/api/v2/list_movies.json?query_term=' + encodeURIComponent(imdb) + '&limit=20');
+      const movies = (d && d.data && d.data.movies) || [];
+      movies.forEach((mv) => { (mv.torrents || []).forEach((t) => { if (Number(t.size_bytes) > 150 * 1048576) add(t.hash, (mv.title || '') + ' ' + (t.quality || '') + ' YTS', Number(t.seeds), Number(t.size_bytes)); }); });
     })().catch(() => {}));
   } else {
     jobs.push((async () => {
@@ -428,7 +450,7 @@ async function localStreamData(type, videoId) {
       const seriesName = meta && meta.meta && meta.meta.name;
       if (!seriesName) return;
       const ep = 'S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0');
-      const d = await tfFetchJSON('https://apibay.org/q.php?q=' + encodeURIComponent(seriesName + ' ' + ep) + '&cat=200');
+      const d = await tfSearchJSON('https://apibay.org/q.php?q=' + encodeURIComponent(seriesName + ' ' + ep) + '&cat=200');
       (Array.isArray(d) ? d : []).forEach((t) => { if (Number(t.size) > 80 * 1048576) add(t.info_hash, t.name, Number(t.seeders), Number(t.size)); });
     })().catch(() => {}));
   }
